@@ -72,7 +72,9 @@ def general_auditor_node(state: AgentState):
     if not retriever:
         return {"audit_logs": ["*Error: DB not found. Run indexer.py*"]}
 
-    general_rules = retriever.get_relevant_documents("p-values confidence intervals significant figures exact p-values")
+    # --- FIX: Changed get_relevant_documents to invoke ---
+    general_rules = retriever.invoke("p-values confidence intervals significant figures exact p-values")
+    
     rule_text = "\n".join([doc.page_content for doc in general_rules])
     
     prompt = ChatPromptTemplate.from_template(
@@ -100,8 +102,10 @@ def specific_auditor_node(state: AgentState):
         query = "causality causal language observational study confounding"
     else:
         query = "randomized clinical trial CONSORT"
-        
-    specific_rules = retriever.get_relevant_documents(query)
+    
+    # --- FIX: Changed get_relevant_documents to invoke ---
+    specific_rules = retriever.invoke(query)
+    
     rule_text = "\n".join([doc.page_content for doc in specific_rules])
     
     prompt = ChatPromptTemplate.from_template(
