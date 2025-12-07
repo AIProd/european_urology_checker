@@ -29,7 +29,6 @@ def get_azure_resources():
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        temperature=0
     )
 
     embedding_function = AzureOpenAIEmbeddings(
