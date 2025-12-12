@@ -1,105 +1,94 @@
 # indexer.py
 
 import os
-from typing import List
-
+import shutil
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
 from langchain_openai import AzureOpenAIEmbeddings
-from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_core.documents import Document
 
 load_dotenv()
 
 GUIDELINES_DIR = "./guidelines"
+DB_DIR = "./chroma_db"
 
 
-def _get_embedding_function() -> AzureOpenAIEmbeddings:
-    """Create a *single, consistent* Azure embedding client."""
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-    azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
-    embedding_deployment = os.getenv("AZURE_EMBEDDING_DEPLOYMENT")
-
-    if not all([azure_endpoint, azure_api_key, azure_api_version, embedding_deployment]):
-        raise ValueError(
-            "Missing Azure embedding env vars. "
-            "Expected AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-            "AZURE_OPENAI_API_VERSION, AZURE_EMBEDDING_DEPLOYMENT."
-        )
-
-    return AzureOpenAIEmbeddings(
-        azure_deployment=embedding_deployment,
-        azure_endpoint=azure_endpoint,
-        openai_api_key=azure_api_key,
-        openai_api_version=azure_api_version,
-    )
+def infer_guideline_type(filename: str) -> str:
+    """Map a guideline PDF to a high-level type for filtered retrieval."""
+    fn = filename.lower()
+    if "causality" in fn:
+        return "causality"
+    if "figure" in fn or "table" in fn:
+        return "figures_tables"
+    if "systematic" in fn or "meta" in fn:
+        return "systematic_meta"
+    if "stat" in fn:
+        return "statistics"
+    return "other"
 
 
-def _load_guideline_docs() -> List[Document]:
-    """Load all guideline PDFs from ./guidelines as LangChain Documents."""
-    if not os.path.exists(GUIDELINES_DIR):
-        raise FileNotFoundError(
-            f"Guidelines folder '{GUIDELINES_DIR}' not found. "
-            "Upload the EU guideline PDFs via the Streamlit UI first."
-        )
+def build_knowledge_base():
+    # 0. Key check
+    if not os.getenv("AZURE_OPENAI_API_KEY"):
+        print("ERROR: AZURE_OPENAI_API_KEY not found in .env file.")
+        return
 
-    pdf_files = [
-        f for f in os.listdir(GUIDELINES_DIR)
-        if f.lower().endswith(".pdf")
-    ]
-    if not pdf_files:
-        raise RuntimeError(
-            f"No PDF files found in {GUIDELINES_DIR}. "
-            "Upload the 4 EU guideline PDFs there."
-        )
+    # 1. Clean up old DB
+    if os.path.exists(DB_DIR):
+        shutil.rmtree(DB_DIR)
 
-    documents: List[Document] = []
-    for file in pdf_files:
+    os.makedirs(GUIDELINES_DIR, exist_ok=True)
+
+    # 2. Find PDFs
+    files = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
+    if not files:
+        print(f"No PDF files found in {GUIDELINES_DIR}.")
+        return
+
+    documents = []
+
+    # 3. Load PDFs + set metadata
+    for file in files:
         path = os.path.join(GUIDELINES_DIR, file)
+        print(f"Loading {path}...")
         loader = PyPDFLoader(path)
         docs = loader.load()
-        for d in docs:
-            d.metadata["source_doc"] = file
+        gtype = infer_guideline_type(file)
+        for doc in docs:
+            doc.metadata["source_doc"] = file
+            doc.metadata["guideline_type"] = gtype
         documents.extend(docs)
 
-    return documents
+    if not documents:
+        print("No documents loaded from guideline PDFs.")
+        return
 
-
-def _build_inmemory_vectorstore() -> InMemoryVectorStore:
-    """Build an in-memory vector store from the guideline PDFs."""
-    embedding = _get_embedding_function()
-    docs = _load_guideline_docs()
-
-    splitter = RecursiveCharacterTextSplitter(
+    # 4. Split into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100,
     )
-    chunks = splitter.split_documents(docs)
+    splits = text_splitter.split_documents(documents)
+    print(f"Indexing {len(splits)} chunks...")
 
-    vector_store = InMemoryVectorStore(embedding=embedding)
-    vector_store.add_documents(chunks)
-    return vector_store
+    # 5. Embeddings + Vector store
+    embedding_function = AzureOpenAIEmbeddings(
+        model=os.getenv("AZURE_EMBEDDING_DEPLOYMENT"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    )
+
+    Chroma.from_documents(
+        documents=splits,
+        embedding=embedding_function,
+        persist_directory=DB_DIR,
+        # collection_name optional; default is fine
+    )
+
+    print(f"✅ Success! Database built in {DB_DIR}")
 
 
-def retrieve_guidelines(query: str, k: int = 5) -> List[Document]:
-    """
-    End-to-end helper: load PDFs, build an in-memory vector store,
-    and return top-k relevant guideline chunks for the given query.
-    """
-    vector_store = _build_inmemory_vectorstore()
-    retriever = vector_store.as_retriever(search_kwargs={"k": k})
-    return retriever.invoke(query)
-
-
-def build_knowledge_base() -> None:
-    """
-    Used by the 'Build Database' button.
-
-    It doesn't persist anything; it just does a dry-run build + query
-    so you get early visibility if Azure / guidelines are misconfigured.
-    """
-    docs = _load_guideline_docs()
-    _ = retrieve_guidelines("statistical reporting guidelines", k=1)
-    print(f"✅ Knowledge base OK – loaded {len(docs)} guideline pages.")
+if __name__ == "__main__":
+    build_knowledge_base()
