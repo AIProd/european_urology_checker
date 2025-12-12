@@ -2,17 +2,16 @@
 
 import operator
 import os
-from dotenv import load_dotenv
 from typing import Annotated, List, TypedDict
 
+from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.vectorstores import Chroma
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_openai import AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 
-load_dotenv()
+from indexer import retrieve_guidelines  # <-- our in-memory RAG helper
 
-DB_DIR = "./chroma_db"
+load_dotenv()
 
 
 # --- 1. STATE DEFINITION ---
@@ -24,55 +23,33 @@ class AgentState(TypedDict):
     final_report: str
 
 
-# --- 2. SETUP MODELS & DB ---
+# --- 2. LLM SETUP ---
 
-def get_azure_resources():
-    """
-    Create Azure LLM + embedding client with consistent config.
-    """
+def _get_llm() -> AzureChatOpenAI:
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
     azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
     chat_deployment = os.getenv("AZURE_DEPLOYMENT_NAME")
-    embedding_deployment = os.getenv("AZURE_EMBEDDING_DEPLOYMENT")
 
-    if not all([azure_endpoint, azure_api_key, azure_api_version, chat_deployment, embedding_deployment]):
+    if not all([azure_endpoint, azure_api_key, azure_api_version, chat_deployment]):
         raise ValueError(
-            "Missing Azure env vars. Expected: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-            "AZURE_OPENAI_API_VERSION, AZURE_DEPLOYMENT_NAME, AZURE_EMBEDDING_DEPLOYMENT."
+            "Missing Azure env vars. Expected: AZURE_OPENAI_ENDPOINT, "
+            "AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_DEPLOYMENT_NAME."
         )
 
-    llm = AzureChatOpenAI(
+    return AzureChatOpenAI(
         azure_deployment=chat_deployment,
         azure_endpoint=azure_endpoint,
         openai_api_key=azure_api_key,
         openai_api_version=azure_api_version,
     )
 
-    embedding_function = AzureOpenAIEmbeddings(
-        azure_deployment=embedding_deployment,
-        azure_endpoint=azure_endpoint,
-        openai_api_key=azure_api_key,
-        openai_api_version=azure_api_version,
-    )
-
-    return llm, embedding_function
-
 
 try:
-    llm, embedding_function = get_azure_resources()
-    if os.path.exists(DB_DIR):
-        vectorstore = Chroma(
-            persist_directory=DB_DIR,
-            embedding_function=embedding_function,
-        )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    else:
-        retriever = None
+    llm = _get_llm()
 except Exception as e:
-    print(f"Initialization Warning: {e}")
+    print(f"Initialization Warning (LLM): {e}")
     llm = None
-    retriever = None
 
 
 # --- 3. NODES ---
@@ -93,6 +70,7 @@ def classifier_node(state: AgentState):
     )
     chain = prompt | llm
     category = chain.invoke({"text": content_snippet}).content.strip()
+
     return {
         "paper_type": category,
         "audit_logs": [f"**Paper classified as:** {category}"],
@@ -103,15 +81,20 @@ def general_auditor_node(state: AgentState):
     if llm is None:
         return {"audit_logs": ["❌ LLM is not initialized."]}
 
-    if not retriever:
-        return {"audit_logs": ["⚠️ Error: Knowledge base (Chroma DB) not found. Build it first."]}
+    try:
+        general_rules_docs = retrieve_guidelines(
+            "p-values, confidence intervals, effect sizes, "
+            "exact p-values, statistical reporting, significant figures",
+            k=5,
+        )
+    except Exception as e:
+        return {
+            "audit_logs": [
+                f"⚠️ Could not retrieve guideline chunks for general stats check: {e}"
+            ]
+        }
 
-    # Retrieve general statistical rules
-    general_rules_docs = retriever.invoke(
-        "p-values, confidence intervals, effect sizes, exact p-values, "
-        "statistical reporting guidelines"
-    )
-    rule_text = "\n".join([doc.page_content for doc in general_rules_docs])
+    rule_text = "\n".join(doc.page_content for doc in general_rules_docs)
 
     # Take a middle chunk of the paper for general stats check
     n = len(state["paper_content"])
@@ -136,20 +119,25 @@ def specific_auditor_node(state: AgentState):
     if llm is None:
         return {"audit_logs": ["❌ LLM is not initialized."]}
 
-    if not retriever:
-        return {"audit_logs": ["⚠️ Error: Knowledge base (Chroma DB) not found for specific check."]}
-
     paper_type = state["paper_type"] or ""
 
     if "Systematic" in paper_type or "Meta" in paper_type:
-        query = "PRISMA guidelines, systematic review, meta-analysis checklist, heterogeneity"
+        query = "PRISMA, systematic review, meta-analysis checklist, heterogeneity"
     elif "Observational" in paper_type:
-        query = "causality, causal language, confounding, observational study guidelines"
+        query = "causality, causal language, confounding, bias, observational study"
     else:
-        query = "randomized clinical trial, CONSORT, allocation, blinding, intention-to-treat"
+        query = "CONSORT, randomized clinical trial, allocation, blinding, ITT"
 
-    specific_rules_docs = retriever.invoke(query)
-    rule_text = "\n".join([doc.page_content for doc in specific_rules_docs])
+    try:
+        specific_rules_docs = retrieve_guidelines(query, k=5)
+    except Exception as e:
+        return {
+            "audit_logs": [
+                f"⚠️ Could not retrieve guideline chunks for specific check: {e}"
+            ]
+        }
+
+    rule_text = "\n".join(doc.page_content for doc in specific_rules_docs)
 
     # Take end of the paper (Discussion/Conclusion)
     end_text = state["paper_content"][-3000:]
