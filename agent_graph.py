@@ -6,13 +6,12 @@ from typing import Annotated, List, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.vectorstores import Chroma
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_openai import AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 
-load_dotenv()
+from indexer import retrieve_guidelines_by_type  # our RAG helper
 
-DB_DIR = "./chroma_db"
+load_dotenv()
 
 
 # --- 1. STATE ---
@@ -24,63 +23,33 @@ class AgentState(TypedDict):
     final_report: str
 
 
-# --- 2. MODELS + RETRIEVERS ---
+# --- 2. LLM SETUP ---
 
-def get_azure_resources():
-    if not os.getenv("AZURE_OPENAI_API_KEY"):
-        raise ValueError("Azure keys missing from environment variables.")
+def _get_llm() -> AzureChatOpenAI:
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+    chat_deployment = os.getenv("AZURE_DEPLOYMENT_NAME")
 
-    llm = AzureChatOpenAI(
-        azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    if not all([azure_endpoint, azure_api_key, azure_api_version, chat_deployment]):
+        raise ValueError(
+            "Missing Azure env vars. Expected: AZURE_OPENAI_ENDPOINT, "
+            "AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_DEPLOYMENT_NAME."
+        )
+
+    return AzureChatOpenAI(
+        azure_deployment=chat_deployment,
+        azure_endpoint=azure_endpoint,
+        openai_api_key=azure_api_key,
+        openai_api_version=azure_api_version,
     )
-
-    embedding_function = AzureOpenAIEmbeddings(
-        model=os.getenv("AZURE_EMBEDDING_DEPLOYMENT"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-    )
-
-    return llm, embedding_function
 
 
 try:
-    llm, embedding_function = get_azure_resources()
-
-    if os.path.exists(DB_DIR):
-        vectorstore = Chroma(
-            persist_directory=DB_DIR,
-            embedding_function=embedding_function,
-        )
-
-        stats_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5, "filter": {"guideline_type": "statistics"}}
-        )
-        figtab_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5, "filter": {"guideline_type": "figures_tables"}}
-        )
-        causality_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5, "filter": {"guideline_type": "causality"}}
-        )
-        srma_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5, "filter": {"guideline_type": "systematic_meta"}}
-        )
-    else:
-        stats_retriever = None
-        figtab_retriever = None
-        causality_retriever = None
-        srma_retriever = None
-
+    llm = _get_llm()
 except Exception as e:
-    print(f"Initialization warning in agent_graph: {e}")
+    print(f"Initialization Warning (LLM): {e}")
     llm = None
-    stats_retriever = None
-    figtab_retriever = None
-    causality_retriever = None
-    srma_retriever = None
 
 
 # --- 3. NODES ---
@@ -126,15 +95,17 @@ def stats_auditor_node(state: AgentState):
     if llm is None:
         return {"audit_logs": ["*Error: LLM not initialized.*"]}
 
-    if stats_retriever is None:
-        return {"audit_logs": ["*Error: Stats guideline DB not available. Build knowledge base first.*"]}
+    try:
+        guideline_docs = retrieve_guidelines_by_type(
+            "statistics",
+            "p-values, confidence intervals, precision, effect sizes, "
+            "primary endpoint, sample size",
+            k=5,
+        )
+    except Exception as e:
+        return {"audit_logs": [f"### Statistical Reporting Check\nCould not load statistics guidelines: {e}"]}
 
-    guideline_docs = stats_retriever.invoke(
-        "p-values, confidence intervals, precision, effect sizes, primary endpoint, sample size"
-    )
-    rules = "\n\n".join([d.page_content for d in guideline_docs])
-
-    # Use a reasonably sized snippet – but Azure models can handle long contexts.
+    rules = "\n\n".join(d.page_content for d in guideline_docs)
     paper_snip = state["paper_content"]
 
     prompt = ChatPromptTemplate.from_template(
@@ -175,7 +146,6 @@ If there are essentially no problems, say explicitly that statistical reporting 
     )
 
     resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
-
     return {"audit_logs": [resp.content]}
 
 
@@ -184,14 +154,17 @@ def figtab_auditor_node(state: AgentState):
     if llm is None:
         return {"audit_logs": ["*Error: LLM not initialized.*"]}
 
-    if figtab_retriever is None:
-        return {"audit_logs": ["*Error: Figures/Tables guideline DB not available. Build knowledge base first.*"]}
+    try:
+        guideline_docs = retrieve_guidelines_by_type(
+            "figures_tables",
+            "figures tables graphs dos and don'ts precision labels legends "
+            "Kaplan-Meier tables example",
+            k=5,
+        )
+    except Exception as e:
+        return {"audit_logs": [f"### Figures and Tables Check\nCould not load figures/tables guidelines: {e}"]}
 
-    guideline_docs = figtab_retriever.invoke(
-        "figures tables graphs dos and don'ts precision labels legends Kaplan-Meier tables example"
-    )
-    rules = "\n\n".join([d.page_content for d in guideline_docs])
-
+    rules = "\n\n".join(d.page_content for d in guideline_docs)
     paper_snip = state["paper_content"]
 
     prompt = ChatPromptTemplate.from_template(
@@ -233,7 +206,6 @@ Summarize:
     )
 
     resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
-
     return {"audit_logs": [resp.content]}
 
 
@@ -250,13 +222,16 @@ def type_specific_auditor_node(state: AgentState):
 
     # Observational / causal focus
     if "observational" in paper_type:
-        if causality_retriever is None:
-            return {"audit_logs": ["*Error: Causality guideline DB not available. Build knowledge base first.*"]}
+        try:
+            guideline_docs = retrieve_guidelines_by_type(
+                "causality",
+                "causal language, confounding, causal pathways, introduction, methods, discussion",
+                k=5,
+            )
+        except Exception as e:
+            return {"audit_logs": [f"### Causality / Observational Study Check\nCould not load causality guidelines: {e}"]}
 
-        guideline_docs = causality_retriever.invoke(
-            "causal language, confounding, causal pathways, introduction methods discussion"
-        )
-        rules = "\n\n".join([d.page_content for d in guideline_docs])
+        rules = "\n\n".join(d.page_content for d in guideline_docs)
 
         prompt = ChatPromptTemplate.from_template(
             """
@@ -302,13 +277,16 @@ Under that heading, summarize:
 
     # Systematic Review / Meta-analysis
     if "systematic review" in paper_type or "meta-analysis" in paper_type or "meta analysis" in paper_type:
-        if srma_retriever is None:
-            return {"audit_logs": ["*Error: SR/MA guideline DB not available. Build knowledge base first.*"]}
+        try:
+            guideline_docs = retrieve_guidelines_by_type(
+                "systematic_meta",
+                "PRISMA MOOSE heterogeneity SUCRA protocol reproducible methods justification for review",
+                k=5,
+            )
+        except Exception as e:
+            return {"audit_logs": [f"### Systematic Review / Meta-analysis Check\nCould not load SR/MA guidelines: {e}"]}
 
-        guideline_docs = srma_retriever.invoke(
-            "PRISMA MOOSE heterogeneity SUCRA protocol reproducible methods justification for review"
-        )
-        rules = "\n\n".join([d.page_content for d in guideline_docs])
+        rules = "\n\n".join(d.page_content for d in guideline_docs)
 
         prompt = ChatPromptTemplate.from_template(
             """
@@ -346,13 +324,16 @@ Summarize:
             """
         )
 
-        resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip, "ptype": state.get("paper_type", "")})
+        resp = (prompt | llm).invoke(
+            {"rules": rules, "paper": paper_snip, "ptype": state.get("paper_type", "")}
+        )
         return {"audit_logs": [resp.content]}
 
     # For RCTs or other designs, no additional type-specific guideline beyond general stats/figures.
     return {
         "audit_logs": [
-            "### Type-Specific Check\nStudy type does not trigger additional causality or SR/MA checks beyond general statistics and figures/tables."
+            "### Type-Specific Check\nStudy type does not trigger additional causality or SR/MA checks "
+            "beyond general statistics and figures/tables."
         ]
     }
 
@@ -360,14 +341,14 @@ Summarize:
 def reporter_node(state: AgentState):
     """Combine logs into a single editorial-style report."""
     if llm is None:
-        # Fallback: simple concatenation if LLM not available
         logs_text = "\n\n".join(state.get("audit_logs", []))
-        report = (
-            f"🇪🇺 European Urology Statistical Report\n"
+        fallback = (
+            "🇪🇺 European Urology Statistical Report\n"
             f"Detected Type: {state.get('paper_type', 'Unknown')}\n\n"
+            "LLM not initialized – showing raw logs:\n\n"
             f"{logs_text}"
         )
-        return {"final_report": report}
+        return {"final_report": fallback}
 
     logs_text = "\n\n---\n\n".join(state.get("audit_logs", []))
 
@@ -389,7 +370,7 @@ Below are their raw notes (unordered, with some overlap):
 Using ONLY these notes (do not invent details you do not see),
 draft a concise report in markdown with EXACTLY the following structure:
 
-🇪🇺 European Urology Statistical Report  
+🇪🇺 European Urology Statistical Report
 Detected Type: {paper_type}
 
 Overall summary
@@ -420,7 +401,6 @@ Be concrete but not aggressive in tone, and keep the length similar to an intern
     resp = (prompt | llm).invoke(
         {"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text}
     )
-
     return {"final_report": resp.content}
 
 
