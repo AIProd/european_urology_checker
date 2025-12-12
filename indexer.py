@@ -1,21 +1,22 @@
 # indexer.py
 
 import os
-import shutil
+from typing import List
+
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_openai import AzureOpenAIEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_core.documents import Document
 
 load_dotenv()
 
 GUIDELINES_DIR = "./guidelines"
-DB_DIR = "./chroma_db"
 
 
 def infer_guideline_type(filename: str) -> str:
-    """Map a guideline PDF to a high-level type for filtered retrieval."""
+    """Map guideline filename to a high-level type."""
     fn = filename.lower()
     if "causality" in fn:
         return "causality"
@@ -28,67 +29,117 @@ def infer_guideline_type(filename: str) -> str:
     return "other"
 
 
-def build_knowledge_base():
-    # 0. Key check
-    if not os.getenv("AZURE_OPENAI_API_KEY"):
-        print("ERROR: AZURE_OPENAI_API_KEY not found in .env file.")
-        return
+def _get_embedding_function() -> AzureOpenAIEmbeddings:
+    """Create a single, consistent Azure embedding client."""
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+    embedding_deployment = os.getenv("AZURE_EMBEDDING_DEPLOYMENT")
 
-    # 1. Clean up old DB
-    if os.path.exists(DB_DIR):
-        shutil.rmtree(DB_DIR)
+    if not all([azure_endpoint, azure_api_key, azure_api_version, embedding_deployment]):
+        raise ValueError(
+            "Missing Azure embedding env vars. Expected: "
+            "AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+            "AZURE_OPENAI_API_VERSION, AZURE_EMBEDDING_DEPLOYMENT."
+        )
 
-    os.makedirs(GUIDELINES_DIR, exist_ok=True)
+    return AzureOpenAIEmbeddings(
+        azure_deployment=embedding_deployment,
+        azure_endpoint=azure_endpoint,
+        openai_api_key=azure_api_key,
+        openai_api_version=azure_api_version,
+    )
 
-    # 2. Find PDFs
-    files = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
-    if not files:
-        print(f"No PDF files found in {GUIDELINES_DIR}.")
-        return
 
-    documents = []
+def _load_guideline_docs() -> List[Document]:
+    """Load all guideline PDFs as LangChain Documents with guideline_type metadata."""
+    if not os.path.exists(GUIDELINES_DIR):
+        raise FileNotFoundError(
+            f"Guidelines folder '{GUIDELINES_DIR}' not found. "
+            "Upload the EU guideline PDFs via the Streamlit sidebar first."
+        )
 
-    # 3. Load PDFs + set metadata
-    for file in files:
+    pdf_files = [
+        f for f in os.listdir(GUIDELINES_DIR)
+        if f.lower().endswith(".pdf")
+    ]
+    if not pdf_files:
+        raise RuntimeError(
+            f"No PDF files found in {GUIDELINES_DIR}. "
+            "Upload the 4 EU guideline PDFs there."
+        )
+
+    documents: List[Document] = []
+    for file in pdf_files:
         path = os.path.join(GUIDELINES_DIR, file)
-        print(f"Loading {path}...")
         loader = PyPDFLoader(path)
         docs = loader.load()
         gtype = infer_guideline_type(file)
-        for doc in docs:
-            doc.metadata["source_doc"] = file
-            doc.metadata["guideline_type"] = gtype
+        for d in docs:
+            d.metadata["source_doc"] = file
+            d.metadata["guideline_type"] = gtype
         documents.extend(docs)
 
-    if not documents:
-        print("No documents loaded from guideline PDFs.")
-        return
+    return documents
 
-    # 4. Split into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
+
+def _split_docs(docs: List[Document]) -> List[Document]:
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100,
     )
-    splits = text_splitter.split_documents(documents)
-    print(f"Indexing {len(splits)} chunks...")
-
-    # 5. Embeddings + Vector store
-    embedding_function = AzureOpenAIEmbeddings(
-        model=os.getenv("AZURE_EMBEDDING_DEPLOYMENT"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-    )
-
-    Chroma.from_documents(
-        documents=splits,
-        embedding=embedding_function,
-        persist_directory=DB_DIR,
-        # collection_name optional; default is fine
-    )
-
-    print(f"✅ Success! Database built in {DB_DIR}")
+    return splitter.split_documents(docs)
 
 
-if __name__ == "__main__":
-    build_knowledge_base()
+def retrieve_guidelines_by_type(
+    guideline_type: str,
+    query: str,
+    k: int = 5,
+) -> List[Document]:
+    """
+    Load PDFs, build an in-memory vector store for the requested guideline type,
+    and return the top-k relevant chunks.
+    """
+    all_docs = _load_guideline_docs()
+    typed_docs = [
+        d for d in all_docs
+        if d.metadata.get("guideline_type") == guideline_type
+    ]
+    if not typed_docs:
+        raise RuntimeError(
+            f"No documents found for guideline_type='{guideline_type}'. "
+            "Check that filenames contain e.g. 'Stat', 'Causality', "
+            "'Figures and Tables', 'Systematic review'."
+        )
+
+    chunks = _split_docs(typed_docs)
+    embedding = _get_embedding_function()
+
+    vs = InMemoryVectorStore(embedding=embedding)
+    vs.add_documents(chunks)
+    retriever = vs.as_retriever(search_kwargs={"k": k})
+    return retriever.invoke(query)
+
+
+def build_knowledge_base() -> None:
+    """
+    Called by the 'Build Database' button.
+
+    It doesn't persist anything; it just:
+    - ensures the 4 PDFs exist
+    - does a tiny test retrieval for each guideline type
+    so you get early feedback if something is misconfigured.
+    """
+    docs = _load_guideline_docs()
+    print(f"Loaded {len(docs)} guideline pages from {GUIDELINES_DIR}.")
+
+    tested_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
+    for gtype in tested_types:
+        try:
+            _ = retrieve_guidelines_by_type(gtype, "test", k=1)
+            print(f"Guideline type '{gtype}': OK")
+        except Exception as e:
+            print(f"Guideline type '{gtype}': ERROR – {e}")
+            raise
+
+    print("✅ Knowledge base validation complete.")
