@@ -129,7 +129,7 @@ if uploaded_paper:
                     st.download_button(
                         "💾 Download review (Markdown)",
                         data=review_md,
-                        file_name=f"{base_name}_eu_stats_review.md",
+                        file_name=f"{base_name}_eu_stats_review.txt",
                         mime="text/markdown",
                     )
 
