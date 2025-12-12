@@ -1,3 +1,5 @@
+# app.py
+
 # --- SQLITE FIX FOR STREAMLIT CLOUD ---
 __import__('pysqlite3')
 import sys
@@ -9,7 +11,7 @@ import os
 import tempfile
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
-import indexer  # our updated indexer
+import indexer
 
 # Load .env (for local use)
 load_dotenv()
@@ -26,41 +28,55 @@ from agent_graph import app_graph
 
 st.title("🇪🇺 European Urology: Statistical Compliance Widget")
 
+GUIDELINES_DIR = "./guidelines"
+
+
+def _guidelines_present() -> bool:
+    return (
+        os.path.exists(GUIDELINES_DIR)
+        and any(f.lower().endswith(".pdf") for f in os.listdir(GUIDELINES_DIR))
+    )
+
+
 # --- SIDEBAR: SETUP ---
 with st.sidebar:
     st.header("1. System Setup")
 
-    if os.path.exists("./chroma_db"):
-        st.success("✅ Knowledge Base Loaded")
+    if _guidelines_present():
+        st.success("✅ Guidelines present")
     else:
-        st.warning("⚠️ Knowledge Base Missing")
+        st.warning("⚠️ Guidelines missing")
 
     st.divider()
 
     st.subheader("Update Knowledge Base")
-    st.info("Upload 4 guideline PDFs here.")
+    st.info("Upload the 4 European Urology statistical guideline PDFs here.")
     uploaded_guidelines = st.file_uploader(
         "Upload Guidelines",
         type="pdf",
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
 
     if st.button("Build Database"):
         if uploaded_guidelines:
-            with st.spinner("Indexing guidelines into Chroma..."):
-                if not os.path.exists("./guidelines"):
-                    os.makedirs("./guidelines")
+            with st.spinner("Saving guidelines and validating knowledge base..."):
+                if not os.path.exists(GUIDELINES_DIR):
+                    os.makedirs(GUIDELINES_DIR)
                 # Save uploaded PDFs into ./guidelines
                 for pdf in uploaded_guidelines:
-                    with open(os.path.join("./guidelines", pdf.name), "wb") as f:
+                    with open(os.path.join(GUIDELINES_DIR, pdf.name), "wb") as f:
                         f.write(pdf.getbuffer())
 
-                # Build KB (will delete old DB and rebuild)
-                indexer.build_knowledge_base()
-                st.success("Database updated!")
-                st.rerun()
+                # Run a dry-run build to verify everything works
+                try:
+                    indexer.build_knowledge_base()
+                    st.success("Knowledge base validated!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error while building knowledge base: {e}")
         else:
             st.error("Upload files first.")
+
 
 # --- MAIN: CHECKER ---
 st.header("2. Run Compliance Check")
@@ -68,8 +84,8 @@ uploaded_paper = st.file_uploader("Upload Manuscript (PDF)", type="pdf")
 
 if uploaded_paper:
     if st.button("Analyze Manuscript"):
-        if not os.path.exists("./chroma_db"):
-            st.error("Build knowledge base first!")
+        if not _guidelines_present():
+            st.error("Upload and build the guideline knowledge base first (left sidebar).")
         else:
             with st.spinner("Agent is analyzing..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
