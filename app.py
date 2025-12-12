@@ -98,13 +98,9 @@ uploaded_paper = st.file_uploader("Upload Manuscript (PDF)", type="pdf")
 if uploaded_paper:
     if st.button("Analyze Manuscript"):
         if not _guidelines_present():
-            st.error(
-                "Guidelines are not present. Please upload the four EU guideline PDFs "
-                "and click 'Build / Validate Knowledge Base' in the sidebar first."
-            )
+            st.error("Upload and build the guideline knowledge base first (left sidebar).")
         else:
-            with st.spinner("Agent graph is analyzing the manuscript..."):
-                # Save uploaded paper to a temp file
+            with st.spinner("Agent is analyzing..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_paper.read())
                     tmp_path = tmp.name
@@ -112,7 +108,7 @@ if uploaded_paper:
                 try:
                     loader = PyPDFLoader(tmp_path)
                     pages = loader.load()
-                    full_text = "\n".join(p.page_content for p in pages)
+                    full_text = "\n".join([p.page_content for p in pages])
 
                     initial_state = {
                         "paper_content": full_text,
@@ -123,13 +119,21 @@ if uploaded_paper:
 
                     result = app_graph.invoke(initial_state)
 
-                    st.success("Analysis complete.")
-                    st.markdown(result["final_report"])
+                    st.success("Analysis Complete")
+
+                    review_md = result["final_report"]
+                    st.markdown(review_md)
+
+                    # 🔽 NEW: Download button
+                    base_name = uploaded_paper.name.rsplit(".", 1)[0]
+                    st.download_button(
+                        "💾 Download review (Markdown)",
+                        data=review_md,
+                        file_name=f"{base_name}_eu_stats_review.md",
+                        mime="text/markdown",
+                    )
 
                 except Exception as e:
-                    st.error(f"Error during analysis: {e}")
+                    st.error(f"Error: {e}")
                 finally:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                    os.remove(tmp_path)
